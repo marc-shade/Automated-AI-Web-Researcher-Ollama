@@ -7,7 +7,7 @@ import json
 import logging
 import curses
 import signal
-from typing import List, Dict, Set, Optional, Tuple, Union
+from typing import List, Dict, Set, Optional, Tuple, Union, Callable, Generator, Any
 from dataclasses import dataclass
 from queue import Queue
 from datetime import datetime
@@ -19,6 +19,7 @@ import tty
 from threading import Event
 from urllib.parse import urlparse
 from pathlib import Path
+from ollama_client import ollama
 
 # Initialize colorama for cross-platform color support
 if os.name == 'nt':  # Windows-specific initialization
@@ -74,15 +75,114 @@ class AnalysisResult:
             self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 class StrategicAnalysisParser:
-    def __init__(self, llm=None):
-        self.llm = llm
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, model_name: str, temperature: float = 0.7, max_tokens: int = 4000):
+        """Initialize the parser with model settings.
+        
+        Args:
+            model_name: Name of the Ollama model to use
+            temperature: Model temperature (0.0 to 1.0)
+            max_tokens: Maximum tokens to generate
+        """
+        self.model_name = model_name
+        self.temperature = temperature
+        self.max_tokens = max_tokens
         # Simplify patterns to match exactly what we expect
         self.patterns = {
             'priority': [
                 r"Priority:\s*(\d+)",  # Match exactly what's in our prompt
             ]
         }
+        
+        # Validate model exists
+        try:
+            models = ollama.list_models()
+            available_models = [m["name"] for m in models.get("models", [])]
+            
+            if self.model_name not in available_models:
+                # Try to find a suitable alternative
+                for model in available_models:
+                    if "mistral" in model.lower():
+                        self.model_name = model
+                        logger.info(f"Using alternative model: {self.model_name}")
+                        break
+                else:
+                    # Use any available model
+                    if available_models:
+                        self.model_name = available_models[0]
+                        logger.info(f"Using fallback model: {self.model_name}")
+                    else:
+                        raise ValueError("No models available")
+                        
+        except Exception as e:
+            logger.error(f"Error validating model: {str(e)}")
+            raise
+
+    def generate_response(self, prompt: str) -> str:
+        """Generate a response using Ollama."""
+        try:
+            # Create a response accumulator
+            full_response = []
+            
+            # Use streaming for better responsiveness
+            response = ollama.generate(
+                model=self.model_name,
+                prompt=prompt,
+                options={
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens
+                },
+                stream=True
+            )
+            
+            # Handle direct string response
+            if isinstance(response, str):
+                print(response, end="", flush=True)
+                return response.strip()
+                
+            # Handle dictionary response (error case)
+            if isinstance(response, dict):
+                if "error" in response:
+                    raise Exception(response["error"])
+                return response.get("response", "").strip()
+                
+            # Handle streaming response (generator)
+            try:
+                for chunk in response:
+                    # Handle dictionary chunks
+                    if isinstance(chunk, dict):
+                        if "error" in chunk:
+                            raise Exception(chunk["error"])
+                            
+                        response_text = chunk.get("response", "")
+                        if response_text:
+                            full_response.append(response_text)
+                            print(response_text, end="", flush=True)
+                    # Handle string chunks
+                    elif isinstance(chunk, str):
+                        full_response.append(chunk)
+                        print(chunk, end="", flush=True)
+                    # Handle other chunk types
+                    else:
+                        text = str(chunk)
+                        full_response.append(text)
+                        print(text, end="", flush=True)
+                        
+            except TypeError as e:
+                # Not a generator, try to get response directly
+                if hasattr(response, 'get'):
+                    return response.get("response", "").strip()
+                return str(response).strip()
+                
+            # Join all response chunks
+            result = "".join(full_response).strip()
+            if not result:
+                return "Error: No response generated"
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {str(e)}")
+            return f"Error: {str(e)}"
 
     def strategic_analysis(self, original_query: str) -> Optional[AnalysisResult]:
         """Generate and process research areas with retries until success"""
@@ -112,8 +212,9 @@ Priority: [number 1-5]
 5. [Fifth research topic]
 Priority: [number 1-5]
 """
+            
             for attempt in range(max_retries):
-                response = self.llm.generate(prompt, max_tokens=1000)
+                response = self.generate_response(prompt)
                 focus_areas = self._extract_research_areas(response)
 
                 if focus_areas:  # If we got any valid areas
@@ -132,7 +233,7 @@ Priority: [number 1-5]
 
             # If all retries failed, try one final time with a stronger prompt
             prompt += "\n\nIMPORTANT: You MUST provide exactly 5 research areas with priorities. This is crucial."
-            response = self.llm.generate(prompt, max_tokens=1000)
+            response = self.generate_response(prompt)
             focus_areas = self._extract_research_areas(response)
 
             if focus_areas:
@@ -318,9 +419,6 @@ class TerminalUI:
 
         # Enable only scroll wheel events, not all mouse events
         # curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
-
-        # Remove this line that was causing the spam
-        # print('\033[?1003h')  # We don't want mouse movement events
 
         # Get terminal dimensions
         self.max_y, self.max_x = self.stdscr.getmaxyx()
@@ -589,11 +687,10 @@ class NonBlockingInput:
 
 class ResearchManager:
     """Manages the research process including analysis, search, and documentation"""
-    def __init__(self, llm_wrapper, parser, search_engine, max_searches_per_cycle: int = 5):
-        self.llm = llm_wrapper
-        self.parser = parser
-        self.search_engine = search_engine
-        self.max_searches = max_searches_per_cycle
+    def __init__(self, model_name: str, temperature: float = 0.7, max_tokens: int = 4000):
+        self.model_name = model_name
+        self.temperature = temperature
+        self.max_tokens = max_tokens
         self.should_terminate = threading.Event()
         self.shutdown_event = Event()
         self.research_started = threading.Event()
@@ -611,27 +708,302 @@ class ResearchManager:
         self.focus_areas: List[ResearchFocus] = []
         self.is_running = False
 
-        # New conversation mode attributes
-        self.research_complete = False
-        self.research_summary = ""
-        self.conversation_active = False
-        self.research_content = ""
-
         # Initialize document paths
         self.document_path = None
         self.session_files = []
 
-        # Initialize UI and parser
-        self.ui = TerminalUI()
-        self.strategic_parser = StrategicAnalysisParser(llm=self.llm)
+        # Initialize parser
+        self.strategic_parser = StrategicAnalysisParser(self.model_name, self.temperature, self.max_tokens)
 
         # Initialize new flags for pausing and assessment
         self.research_paused = False
         self.awaiting_user_decision = False
 
-        # Setup signal handlers
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+    def cleanup(self):
+        """Clean up resources."""
+        self.shutdown_event.set()
+        self.should_terminate.set()
+        
+        if self.research_thread and self.research_thread.is_alive():
+            try:
+                self.research_thread.join(timeout=1.0)
+            except Exception as e:
+                logger.error(f"Error cleaning up research thread: {str(e)}")
+
+    def generate_response(self, prompt: str) -> str:
+        """Generate a response using Ollama."""
+        try:
+            # Create a response accumulator
+            full_response = []
+            
+            # Use streaming for better responsiveness
+            response = ollama.generate(
+                model=self.model_name,
+                prompt=prompt,
+                options={
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens
+                },
+                stream=True
+            )
+            
+            # Handle direct string response
+            if isinstance(response, str):
+                print(response, end="", flush=True)
+                return response.strip()
+                
+            # Handle dictionary response (error case)
+            if isinstance(response, dict):
+                if "error" in response:
+                    raise Exception(response["error"])
+                return response.get("response", "").strip()
+                
+            # Handle streaming response (generator)
+            try:
+                for chunk in response:
+                    # Handle dictionary chunks
+                    if isinstance(chunk, dict):
+                        if "error" in chunk:
+                            raise Exception(chunk["error"])
+                            
+                        response_text = chunk.get("response", "")
+                        if response_text:
+                            full_response.append(response_text)
+                            print(response_text, end="", flush=True)
+                    # Handle string chunks
+                    elif isinstance(chunk, str):
+                        full_response.append(chunk)
+                        print(chunk, end="", flush=True)
+                    # Handle other chunk types
+                    else:
+                        text = str(chunk)
+                        full_response.append(text)
+                        print(text, end="", flush=True)
+                        
+            except TypeError as e:
+                # Not a generator, try to get response directly
+                if hasattr(response, 'get'):
+                    return response.get("response", "").strip()
+                return str(response).strip()
+                
+            # Join all response chunks
+            result = "".join(full_response).strip()
+            if not result:
+                return "Error: No response generated"
+                
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {str(e)}")
+            return f"Error: {str(e)}"
+
+    def _process_model_response(self, response: Dict[str, Any]) -> str:
+        """Process the response from the model.
+        
+        Args:
+            response: Response dictionary from model
+            
+        Returns:
+            Processed response text
+        """
+        if not response:
+            return ""
+            
+        # Handle potential error responses
+        if "error" in response:
+            logger.error(f"Model response error: {response['error']}")
+            return ""
+            
+        # Extract response text based on response format
+        if isinstance(response.get("response"), str):
+            return response["response"]
+        elif isinstance(response.get("response"), dict):
+            return response["response"].get("content", "")
+        else:
+            logger.warning(f"Unexpected response format: {response}")
+            return str(response.get("response", ""))
+
+    def _validate_model_response(self, response: Dict[str, Any]) -> bool:
+        """Validate that the model response is usable.
+        
+        Args:
+            response: Response dictionary from model
+            
+        Returns:
+            True if response is valid, False otherwise
+        """
+        if not response:
+            return False
+            
+        if "error" in response:
+            logger.error(f"Model response error: {response['error']}")
+            return False
+            
+        if not response.get("response"):
+            logger.error("Empty response from model")
+            return False
+            
+        # Check if response is complete
+        if not response.get("done", False):
+            logger.warning("Incomplete response from model")
+            return False
+            
+        return True
+
+    def research(self, query: str, search_depth: int = 3, max_sources: int = 10, progress_callback=None) -> Generator[str, None, None]:
+        """Run research with progress tracking."""
+        try:
+            # Initialize progress
+            if progress_callback:
+                progress_callback("Starting research...", 0.0)
+                
+            # Generate initial research plan
+            if progress_callback:
+                progress_callback("Generating Research Plan...", 0.1)
+                
+            prompt = f"""Please help me research the following topic: {query}
+            
+            Generate a strategic research plan that breaks this topic into 3-5 key areas to investigate.
+            For each area, provide:
+            1. A clear description of what we need to learn
+            2. Priority level (1-5, where 1 is highest priority)
+            3. 2-3 specific search queries we should use
+            
+            Format your response like this:
+            
+            Research Area 1: [Area Name]
+            Description: [What we need to learn]
+            Priority: [1-5]
+            Search Queries:
+            - [Query 1]
+            - [Query 2]
+            
+            Research Area 2: [Area Name]
+            ...and so on
+            """
+            
+            # Generate research plan
+            research_plan = self.generate_response(prompt)
+            if not research_plan:
+                error_msg = "Failed to generate research plan"
+                logger.error(error_msg)
+                yield {"error": error_msg}
+                return
+                
+            # Display research plan
+            yield f"## Research Plan\n{research_plan}"
+            if progress_callback:
+                progress_callback("Research Plan Generated", 0.2)
+            
+            # Parse research areas
+            areas = []
+            current_area = None
+            
+            for line in research_plan.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                if line.startswith("Research Area"):
+                    if current_area:
+                        areas.append(current_area)
+                    current_area = {"name": line.split(":", 1)[1].strip(), "queries": []}
+                elif line.startswith("Priority:"):
+                    if current_area:
+                        try:
+                            current_area["priority"] = int(line.split(":", 1)[1].strip())
+                        except ValueError:
+                            current_area["priority"] = 3  # Default priority
+                elif line.startswith("-") and current_area:
+                    query = line[1:].strip()
+                    if query:
+                        current_area["queries"].append(query)
+            
+            if current_area:
+                areas.append(current_area)
+            
+            # Sort areas by priority
+            areas.sort(key=lambda x: x.get("priority", 5))
+            
+            # Research each area
+            total_areas = len(areas)
+            for i, area in enumerate(areas):
+                area_progress_start = 0.2 + (0.8 * (i / total_areas))
+                area_progress_end = 0.2 + (0.8 * ((i + 1) / total_areas))
+                
+                yield f"\n## Researching Area: {area['name']}"
+                if progress_callback:
+                    progress_callback(f"Researching area: {area['name']}", area_progress_start)
+                
+                area_findings = []
+                for query in area["queries"]:
+                    # Generate search response
+                    search_prompt = f"""Research Query: {query}
+                    Topic Context: {area['name']} (Part of: {query})
+                    
+                    Please provide:
+                    1. A concise summary of the key findings
+                    2. Important facts or statistics
+                    3. Any notable trends or patterns
+                    4. Potential implications or applications
+                    
+                    Format your response in clear, easy-to-read markdown."""
+                    
+                    response = self.generate_response(search_prompt)
+                    if response:
+                        area_findings.append(response)
+                        yield f"\nFindings for query '{query}':\n{response}"
+                
+                # Synthesize findings for this area
+                if area_findings:
+                    synthesis_prompt = f"""Please synthesize the following research findings about {area['name']}:
+                    
+                    {' '.join(area_findings)}
+                    
+                    Provide:
+                    1. A concise summary of key insights
+                    2. Important patterns or trends
+                    3. Potential implications
+                    
+                    Format your response in clear markdown with appropriate headers."""
+                    
+                    synthesis = self.generate_response(synthesis_prompt)
+                    if synthesis:
+                        yield f"\n### Summary for {area['name']}\n{synthesis}"
+                
+                if progress_callback:
+                    progress_callback(f"Completed research for: {area['name']}", area_progress_end)
+            
+            # Generate final summary
+            if progress_callback:
+                progress_callback("Generating final summary...", 0.95)
+            
+            summary_prompt = f"""Please provide a comprehensive summary of our research on: {query}
+            
+            We investigated the following areas:
+            {', '.join(area['name'] for area in areas)}
+            
+            Provide:
+            1. An executive summary
+            2. Key findings from each area
+            3. Overall patterns and insights
+            4. Recommendations or next steps
+            
+            Format your response in clear markdown with appropriate headers."""
+            
+            final_summary = self.generate_response(summary_prompt)
+            if final_summary:
+                yield f"\n# Final Research Summary\n{final_summary}"
+            
+            if progress_callback:
+                progress_callback("Research complete!", 1.0)
+            
+        except Exception as e:
+            error_msg = f"Error during research: {str(e)}"
+            logger.exception(error_msg)
+            yield {"error": error_msg}
+        finally:
+            self.cleanup()
 
     def _signal_handler(self, signum, frame):
         """Handle interrupt signals"""
@@ -641,12 +1013,12 @@ class ResearchManager:
 
     def print_thinking(self):
         """Display thinking indicator to user"""
-        self.ui.update_output("🧠 Thinking...")
+        self.ui.update_output(" Thinking...")
 
     @staticmethod
     def get_initial_input() -> str:
         """Get the initial research query from user"""
-        print(f"{Fore.GREEN}📝 Enter your message (Press CTRL+D to submit):{Style.RESET_ALL}")
+        print(f"{Fore.GREEN} Enter your message (Press CTRL+D to submit):{Style.RESET_ALL}")
         lines = []
         try:
             while True:
@@ -685,7 +1057,8 @@ Time range: [d/w/m/y/none]
 
 Do not provide any additional information or explanation, note that the time range allows you to see results within a time range (d is within the last day, w is within the last week, m is within the last month, y is within the last year, and none is results from anytime, only select one, using only the corresponding letter for whichever of these options you select as indicated in the response format) use your judgement as many searches will not require a time range and some may depending on what the research focus is.
 """
-            response_text = self.llm.generate(prompt, max_tokens=50, stop=None)
+            
+            response_text = self.generate_response(prompt)
             query, time_range = self.parse_query_response(response_text)
 
             if not query:
@@ -750,81 +1123,6 @@ Do not provide any additional information or explanation, note that the time ran
         except Exception as e:
             logger.error(f"Error parsing search query: {str(e)}")
             return {'query': '', 'time_range': 'none'}
-
-    def _cleanup(self):
-        """Enhanced cleanup to handle conversation mode"""
-        self.conversation_active = False
-        self.should_terminate.set()
-
-        if self.research_thread and self.research_thread.is_alive():
-            try:
-                self.research_thread.join(timeout=1.0)
-                if self.research_thread.is_alive():
-                    import ctypes
-                    ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                        ctypes.c_long(self.research_thread.ident),
-                        ctypes.py_object(SystemExit)
-                    )
-            except Exception as e:
-                logger.error(f"Error terminating research thread: {str(e)}")
-
-        if hasattr(self.llm, 'cleanup'):
-            try:
-                self.llm.cleanup()
-            except Exception as e:
-                logger.error(f"Error cleaning up LLM: {str(e)}")
-
-        if hasattr(self.ui, 'cleanup'):
-            self.ui.cleanup()
-
-    def _initialize_document(self):
-        """Initialize research session document"""
-        try:
-            # Get all existing research session files
-            self.session_files = []
-            for file in os.listdir():
-                if file.startswith("research_session_") and file.endswith(".txt"):
-                    try:
-                        num = int(file.split("_")[2].split(".")[0])
-                        self.session_files.append(num)
-                    except ValueError:
-                        continue
-
-            # Determine next session number
-            next_session = 1 if not self.session_files else max(self.session_files) + 1
-            self.document_path = f"research_session_{next_session}.txt"
-
-            # Initialize the new document
-            with open(self.document_path, 'w', encoding='utf-8') as f:
-                f.write(f"Research Session {next_session}\n")
-                f.write(f"Topic: {self.original_query}\n")
-                f.write(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("="*80 + "\n\n")
-                f.flush()
-
-        except Exception as e:
-            logger.error(f"Error initializing document: {str(e)}")
-            self.document_path = "research_findings.txt"
-            with open(self.document_path, 'w', encoding='utf-8') as f:
-                f.write("Research Findings:\n\n")
-                f.flush()
-
-    def add_to_document(self, content: str, source_url: str, focus_area: str):
-        """Add research findings to current session document"""
-        try:
-            with open(self.document_path, 'a', encoding='utf-8') as f:
-                if source_url not in self.searched_urls:
-                    f.write(f"\n{'='*80}\n")
-                    f.write(f"Research Focus: {focus_area}\n")
-                    f.write(f"Source: {source_url}\n")
-                    f.write(f"Content:\n{content}\n")
-                    f.write(f"{'='*80}\n")
-                    f.flush()
-                    self.searched_urls.add(source_url)
-                    self.ui.update_output(f"Added content from: {source_url}")
-        except Exception as e:
-            logger.error(f"Error adding to document: {str(e)}")
-            self.ui.update_output(f"Error saving content: {str(e)}")
 
     def _process_search_results(self, results: Dict[str, str], focus_area: str):
         """Process and store search results"""
@@ -906,7 +1204,7 @@ Do not provide any additional information or explanation, note that the time ran
                                 selected_urls = self.search_engine.select_relevant_pages(results, query)
 
                                 if selected_urls:
-                                    self.ui.update_output("\n⚙️ Scraping selected pages...")
+                                    self.ui.update_output("\n Scraping selected pages...")
                                     scraped_content = self.search_engine.scrape_content(selected_urls)
                                     if scraped_content:
                                         for url, content in scraped_content.items():
@@ -984,7 +1282,7 @@ Do not provide any additional information or explanation, note that the time ran
             with open(self.document_path, 'r', encoding='utf-8') as f:
                 content = f.read()
             estimated_tokens = len(content.split()) * 1.3
-            max_tokens = self.llm.llm_config.get('n_ctx', 2048)
+            max_tokens = self.max_tokens
             current_ratio = estimated_tokens / max_tokens
 
             if current_ratio > 0.8:
@@ -1016,97 +1314,6 @@ Do not provide any additional information or explanation, note that the time ran
             summary = self.terminate_research()
             self.ui.update_output("\nFinal Research Summary:")
             self.ui.update_output(summary)
-
-    def pause_and_assess(self):
-        """Pause the research and assess if the collected content is sufficient."""
-        try:
-            # Pause the research thread
-            self.ui.update_output("\nPausing research for assessment...")
-            self.research_paused = True
-
-            # Start progress indicator in a separate thread
-            self.summary_ready = False
-            indicator_thread = threading.Thread(
-                target=self.show_progress_indicator,
-                args=("Assessing the researched information...",)
-            )
-            indicator_thread.daemon = True
-            indicator_thread.start()
-
-            # Read the current research content
-            if not os.path.exists(self.document_path):
-                self.summary_ready = True
-                indicator_thread.join()
-                self.ui.update_output("No research data found to assess.")
-                self.research_paused = False
-                return
-
-            with open(self.document_path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-
-            if not content:
-                self.summary_ready = True
-                indicator_thread.join()
-                self.ui.update_output("No research data was collected to assess.")
-                self.research_paused = False
-                return
-
-            # Prepare the prompt for the AI assessment
-            assessment_prompt = f"""
-Based on the following research content, please assess whether the original query "{self.original_query}" can be answered sufficiently with the collected information.
-
-Research Content:
-{content}
-
-Instructions:
-1. If the research content provides enough information to answer the original query in detail, respond with: "The research is sufficient to answer the query."
-2. If not, respond with: "The research is insufficient and it would be advisable to continue gathering information."
-3. Do not provide any additional information or details.
-
-Assessment:
-"""
-
-            # Generate the assessment
-            assessment = self.llm.generate(assessment_prompt, max_tokens=200)
-
-            # Stop the progress indicator
-            self.summary_ready = True
-            indicator_thread.join()
-
-            # Display the assessment
-            self.ui.update_output("\nAssessment Result:")
-            self.ui.update_output(assessment.strip())
-
-            # Provide user with options to continue or quit
-            self.ui.update_output("\nEnter 'c' to continue the research or 'q' to terminate and generate the summary.")
-            self.awaiting_user_decision = True  # Flag to indicate we are waiting for user's decision
-
-            while self.awaiting_user_decision:
-                cmd = self.ui.get_input("Enter command ('c' to continue, 'q' to quit): ")
-                if cmd is None:
-                    continue  # Ignore invalid inputs
-                cmd = cmd.strip().lower()
-                if cmd == 'c':
-                    self.ui.update_output("\nResuming research...")
-                    self.research_paused = False
-                    self.awaiting_user_decision = False
-                elif cmd == 'q':
-                    self.ui.update_output("\nTerminating research and generating summary...")
-                    self.awaiting_user_decision = False
-                    self.should_terminate.set()
-                    summary = self.terminate_research()
-                    self.ui.update_output("\nFinal Research Summary:")
-                    self.ui.update_output(summary)
-                    break
-                else:
-                    self.ui.update_output("Invalid command. Please enter 'c' to continue or 'q' to quit.")
-
-        except Exception as e:
-            logger.error(f"Error during pause and assess: {str(e)}")
-            self.ui.update_output(f"Error during assessment: {str(e)}")
-            self.research_paused = False
-        finally:
-            self.summary_ready = True  # Ensure the indicator thread can exit
 
     def get_progress(self) -> str:
         """Get current research progress"""
@@ -1165,7 +1372,7 @@ Research Progress:
                 Summary:
                 """
 
-                summary = self.llm.generate(summary_prompt, max_tokens=4000)
+                summary = self.generate_response(summary_prompt)
 
                 # Signal that summary is complete to stop the progress indicator
                 self.summary_ready = True
@@ -1365,7 +1572,7 @@ Instructions:
 Answer:
 """
 
-            response = self.llm.generate(
+            response = self.generate_response(
                 prompt,
                 max_tokens=1000,  # Increased for more detailed responses
                 temperature=0.7
@@ -1386,11 +1593,14 @@ Answer:
 
         # Save original terminal settings
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        old_settings = None
+        if os.name != 'nt':
+            old_settings = termios.tcgetattr(fd)
 
         try:
             # Set terminal to raw mode
-            tty.setraw(fd)
+            if os.name != 'nt':
+                tty.setraw(fd)
 
             current_line = []
             while True:
@@ -1427,21 +1637,14 @@ Answer:
 
         finally:
             # Restore terminal settings
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            if old_settings and os.name != 'nt':
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             print()  # New line for clean display
 
 if __name__ == "__main__":
-    from llm_wrapper import LLMWrapper
-    from llm_response_parser import UltimateLLMResponseParser
-    from Self_Improving_Search import EnhancedSelfImprovingSearch
-
     try:
         print(f"{Fore.CYAN}Initializing Research System...{Style.RESET_ALL}")
-        llm = LLMWrapper()
-        parser = UltimateLLMResponseParser()
-        search_engine = EnhancedSelfImprovingSearch(llm, parser)
-        manager = ResearchManager(llm, parser, search_engine)
-
+        manager = ResearchManager("your_model_name")
         print(f"{Fore.GREEN}System initialized. Enter your research topic or 'quit' to exit.{Style.RESET_ALL}")
         while True:
             try:

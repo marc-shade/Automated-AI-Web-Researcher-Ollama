@@ -1,11 +1,18 @@
 llama-cpp-python
-duckduckgo-search
-colorama
-requests
-beautifulsoup4
-trafilatura
-readchar
-keyboard
+duckduckgo-search>=0.10.0
+colorama>=0.4.6
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+trafilatura>=1.6.0
+readchar>=4.0.0
+keyboard>=0.13.0
 curses-windows; sys_platform == 'win32'
-tqdm
-urllib3
+tqdm>=4.66.0
+urllib3>=2.0.0
+streamlit>=1.29.0
+streamlit-extras>=0.3.0
+streamlit-option-menu>=0.3.0
+python-dotenv>=1.0.0
+markdown>=3.5.0
+python-markdown-math>=0.8
+tenacity>=8.2.3
